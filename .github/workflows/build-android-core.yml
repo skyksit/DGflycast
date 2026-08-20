@@ -3,7 +3,10 @@
 # buildbot nightly 프리빌트를 대체하는 자체 빌드. 목적: LIBRETRO 빌드에 libandroid 를
 # DT_NEEDED 로 링크해 weak import ASharedMemory_create 가 동적 링커에서 정상 해석되게
 # 한다 (CMakeLists.txt 의 if(LIBRETRO)+if(ANDROID) 패치). 미링크 시 dlopen 된 코어에서
-# 심볼이 null 로 남아 nvmem 비활성 → VMU 미생성/fastmem 손실 (Pixel 8a/Android 17 사례).
+# 심볼이 null 로 남아 nvmem 비활성 → fastmem 손실/(구코어) 크래시 — 지금까지는 호스트
+# (LibretroDroid)의 GOT 패치가 우회해 왔고, 본 링크는 그 패치 의존을 제거하는 예방 조치.
+# (주의: 리뷰의 "VMU 미생성/입력 무반응"의 실제 원인은 retrople 앱의 컨트롤러 매칭
+#  버그였음 — retrople ControllerConfigs.kt 참조. nvmem 과 별개.)
 #
 # 게이트 3종 (하나라도 실패하면 배포 금지):
 #   A. DT_NEEDED 에 libandroid.so 존재 + UND ASharedMemory_create 심볼 존재 (이번 패치의 성공 판정)
