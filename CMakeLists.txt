@@ -977,6 +977,14 @@ if(LIBRETRO)
 	if(WIN32)
 		target_link_libraries(${PROJECT_NAME} PRIVATE mswsock)
 	endif()
+	if(ANDROID)
+		# DGplayer: link libandroid so the weak ASharedMemory_create import in
+		# core/linux/posix_vmem.cpp resolves via DT_NEEDED. Without this, a core
+		# dlopen'd by an app never binds the symbol (Bionic excludes system libs
+		# from the classloader-namespace global group), nvmem gets disabled and
+		# VMU/fastmem break. Requires ANDROID_PLATFORM >= 26 at build time.
+		target_link_libraries(${PROJECT_NAME} PRIVATE android log)
+	endif()
 endif()
 
 add_subdirectory(core/archive)

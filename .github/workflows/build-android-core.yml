@@ -1,0 +1,132 @@
+# dsam3/retrople 용 Flycast libretro Android 코어(v6, 202608) 빌드.
+#
+# buildbot nightly 프리빌트를 대체하는 자체 빌드. 목적: LIBRETRO 빌드에 libandroid 를
+# DT_NEEDED 로 링크해 weak import ASharedMemory_create 가 동적 링커에서 정상 해석되게
+# 한다 (CMakeLists.txt 의 if(LIBRETRO)+if(ANDROID) 패치). 미링크 시 dlopen 된 코어에서
+# 심볼이 null 로 남아 nvmem 비활성 → VMU 미생성/fastmem 손실 (Pixel 8a/Android 17 사례).
+#
+# 게이트 3종 (하나라도 실패하면 배포 금지):
+#   A. DT_NEEDED 에 libandroid.so 존재 + UND ASharedMemory_create 심볼 존재 (이번 패치의 성공 판정)
+#   B. DT_NEEDED 가 시스템 라이브러리 허용 목록 안인지
+#   C. ELF LOAD 정렬 0x4000 (Android 15+ 16KB 페이지 요구)
+#
+# 산출물 파일명은 CDN 원본명(libflycast_libretro_android.so) 유지 — 버전은 CDN 디렉토리
+# (cores/6.0/<abi>/)로 구분하고, _v6_ 접미사는 앱이 다운로드 시 붙인다 (LibretroCore.kt).
+name: Build Android libretro core
+
+on:
+  push:
+    branches: [ dgplayer ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Clone repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0   # git describe 기반 코어 버전 문자열에 태그 필요
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git curl ca-certificates gawk
+          pip3 config set global.break-system-packages true || true
+          # CMake 4.x 는 cmake_minimum_required < 3.5 구형 의존성에서 fatal — 마지막 3.x 로 고정
+          pip3 install --upgrade ninja 'cmake==3.31.6'
+
+      - name: Locate Android NDK
+        run: |
+          echo "NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          "$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -1
+
+      - name: Build cores (4 ABIs)
+        run: |
+          STRIP="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+            echo "==== $abi ===="
+            # ⚠ ANDROID_PLATFORM 은 26 이상 필수: ASharedMemory_create 는 API 26+ libandroid
+            #   스텁에만 있어, 26 미만으로 링크하면 weak import 가 미해석으로 남는다.
+            cmake -B "build/$abi" -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK_ROOT/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$abi" \
+              -DANDROID_PLATFORM=android-26 \
+              -DANDROID_STL=c++_static \
+              -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
+              -DLIBRETRO=ON \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build "build/$abi" -j"$(nproc)"
+            SO=$(find "build/$abi" -maxdepth 2 -name 'flycast_libretro.so' | head -1)
+            test -n "$SO" || { echo "::error::flycast_libretro.so not found for $abi"; exit 1; }
+            mkdir -p "out/$abi"
+            cp "$SO" "out/$abi/libflycast_libretro_android.so"
+            "$STRIP" "out/$abi/libflycast_libretro_android.so"
+          done
+          # keep the unstripped arm64 core for crash symbolization
+          mkdir -p out/symbols
+          SO=$(find build/arm64-v8a -maxdepth 2 -name 'flycast_libretro.so' | head -1)
+          cp "$SO" out/symbols/flycast_libretro_arm64_unstripped.so
+          ls -lR out
+
+      - name: "Gate A: libandroid NEEDED + ASharedMemory_create import"
+        run: |
+          FAIL=0
+          for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+            SO="out/$abi/libflycast_libretro_android.so"
+            readelf -d "$SO" | grep NEEDED
+            if ! readelf -d "$SO" | grep -q 'NEEDED.*\[libandroid\.so\]'; then
+              echo "::error::$abi: DT_NEEDED 에 libandroid.so 없음 — libandroid 링크 패치가 적용되지 않음"
+              FAIL=1
+            fi
+            if ! readelf --dyn-syms -W "$SO" | grep -q 'UND.*ASharedMemory_create'; then
+              echo "::error::$abi: ASharedMemory_create 동적 import 없음 — ANDROID_PLATFORM<26 스텁으로 링크됐을 가능성"
+              FAIL=1
+            fi
+          done
+          exit $FAIL
+
+      - name: "Gate B: DT_NEEDED allowlist"
+        run: |
+          # Android 시스템 제공 라이브러리만 허용 (동반 배포 라이브러리 없음 — 단일 .so 코어)
+          ALLOW='^lib(c|m|dl|log|z|android|nativewindow|mediandk|amidi|aaudio|OpenSLES|vulkan|EGL|GLESv1_CM|GLESv2|GLESv3)\.so$'
+          FAIL=0
+          for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+            SO="out/$abi/libflycast_libretro_android.so"
+            for need in $(readelf -d "$SO" | awk '/NEEDED/ {gsub(/[\[\]]/,"",$NF); print $NF}'); do
+              if ! echo "$need" | grep -Eq "$ALLOW"; then
+                echo "::error::$abi: 허용 목록 밖 DT_NEEDED: $need — 배포 파일 누락으로 로드 실패함"
+                FAIL=1
+              fi
+              if [ "$need" = "libc++_shared.so" ]; then
+                echo "::error::$abi: libc++_shared 의존 — c++_static 빌드로 다시 실행할 것"
+                FAIL=1
+              fi
+            done
+          done
+          exit $FAIL
+
+      - name: "Gate C: 16KB page alignment"
+        run: |
+          FAIL=0
+          for abi in arm64-v8a x86_64; do
+            SO="out/$abi/libflycast_libretro_android.so"
+            BAD=$(readelf -lW "$SO" | gawk '$1=="LOAD" { if (strtonum($NF) < 0x4000) print }')
+            if [ -n "$BAD" ]; then
+              echo "::error::$abi: LOAD segment alignment < 0x4000 (16KB). Android 15+ 기기에서 로드 실패."
+              readelf -lW "$SO" | grep LOAD
+              FAIL=1
+            fi
+          done
+          [ $FAIL -eq 0 ] && echo "OK: all 64-bit LOAD segments aligned to >= 0x4000"
+          exit $FAIL
+
+      - name: Upload cores
+        uses: actions/upload-artifact@v4
+        with:
+          name: libflycast_v6_libretro_android
+          path: out/
+          if-no-files-found: error
